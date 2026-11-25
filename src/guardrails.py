@@ -1,4 +1,5 @@
 import os
+from collections import Counter
 from typing import Tuple
 
 import pandas as pd
@@ -7,16 +8,37 @@ import pandas as pd
 BASE_GENRES = {"pop", "lofi", "rock", "ambient", "jazz", "synthwave", "indie pop"}
 VALID_MOODS = {"happy", "chill", "intense", "relaxed", "moody", "focused"}
 
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "dataset.csv")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+PARQUET_PATH = os.path.join(DATA_DIR, "songs.parquet")
+OLD_CSV_PATH = os.path.join(DATA_DIR, "dataset.csv")
+
+# A genre goes in the menu (and in Llama's list) if at least this many songs have it
+MIN_SONGS_PER_GENRE = 1500
+
+# Smaller genres people often ask for, added even though they have fewer songs
+EXTRA_GENRES = {
+    "christmas", "worship", "ccm", "christian music", "gospel", "christian hip hop",
+    "afrobeat", "afropop", "amapiano", "bongo flava", "lo fi", "ambient", "house",
+    "techno", "dubstep", "drum and bass", "indie pop", "indie folk", "k pop",
+    "anime", "video game music", "children's music", "meditation", "sleep",
+}
 
 
 def _load_dataset_genres() -> set:
-    # Reads every genre in the real Spotify dataset ("hip-hop" becomes "hip hop")
     try:
-        genres = pd.read_csv(DATASET_PATH, usecols=["track_genre"])["track_genre"]
-        return {str(g).strip().lower().replace("-", " ") for g in genres.unique()}
+        if os.path.exists(PARQUET_PATH):
+            # Every song has a list of genres like "worship, ccm, christian music"
+            tags = pd.read_parquet(PARQUET_PATH, columns=["genre"])["genre"]
+            counts = Counter(g for line in tags for g in line.split(", "))
+            big = {g for g, n in counts.items() if n >= MIN_SONGS_PER_GENRE}
+            extras = {g for g in EXTRA_GENRES if counts.get(g, 0) > 0}
+            return big | extras
+        if os.path.exists(OLD_CSV_PATH):
+            genres = pd.read_csv(OLD_CSV_PATH, usecols=["track_genre"])["track_genre"]
+            return {str(g).strip().lower().replace("-", " ") for g in genres.unique()}
     except Exception:
-        return set()
+        pass
+    return set()
 
 
 DATASET_GENRES = _load_dataset_genres()
