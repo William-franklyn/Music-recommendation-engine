@@ -95,7 +95,7 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
         f"Pick mood from this list only: {moods}\n"
         "energy is a number from 0.0 (very calm) to 1.0 (very intense).\n"
         "likes_acoustic is true or false.\n"
-        "Worship or Christian music means genre \"gospel\".\n"
+        "Worship or Christian music means genre \"worship\". Christmas music means genre \"christmas\".\n"
         "Answer with JSON only and nothing else, like: "
         "{\"genre\": \"gospel\", \"mood\": \"chill\", \"energy\": 0.3, \"likes_acoustic\": true}"
     )
