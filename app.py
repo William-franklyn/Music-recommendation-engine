@@ -14,7 +14,7 @@ from recommender import load_songs, recommend_songs
 setup_logging()
 
 # Use the real Spotify dataset if it's there, otherwise the small sample file
-DATA_PATH = "data/dataset.csv" if os.path.exists("data/dataset.csv") else "data/songs.csv"
+DATA_PATH = "data/songs.parquet" if os.path.exists("data/songs.parquet") else "data/songs.csv"
 
 
 @st.cache_data(show_spinner="Loading songs...")
