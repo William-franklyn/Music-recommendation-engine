@@ -4,53 +4,68 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Meta's Llama, run through Hugging Face Inference Providers.
+# Meta's Llama, run by Cloudflare Workers AI (free daily limit).
 # We try these in order and remember the first one that answers.
 LLAMA_MODELS = [
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Llama-3.2-3B-Instruct",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/meta/llama-3.1-8b-instruct",
+    "@cf/meta/llama-3.2-3b-instruct",
 ]
 _working_model = None
 
 
-def _get_key() -> Optional[str]:
+def _get_secret(name: str) -> Optional[str]:
     # Works on your computer (.env) and on Streamlit Cloud (Secrets)
-    key = os.getenv("HF_TOKEN")
-    if key:
-        return key
+    value = os.getenv(name)
+    if value:
+        return value
     try:
         import streamlit as st
-        return st.secrets.get("HF_TOKEN")
+        return st.secrets.get(name)
     except Exception:
         return None
 
 
+def _has_keys() -> bool:
+    return bool(_get_secret("CLOUDFLARE_API_TOKEN") and _get_secret("CLOUDFLARE_ACCOUNT_ID"))
+
+
 def _ask_llama(prompt: str, max_tokens: int = 300) -> str:
     global _working_model
-    from huggingface_hub import InferenceClient
+    account = _get_secret("CLOUDFLARE_ACCOUNT_ID")
+    token = _get_secret("CLOUDFLARE_API_TOKEN")
 
-    client = InferenceClient(api_key=_get_key())
     models = ([_working_model] if _working_model else []) + [
         m for m in LLAMA_MODELS if m != _working_model
     ]
     last_error = None
     for model in models:
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.2,
+            r = requests.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                },
+                timeout=60,
             )
+            data = r.json()
+            if not r.ok or not data.get("success"):
+                raise RuntimeError(f"HTTP {r.status_code}: {data.get('errors')}")
+            answer = data["result"]["response"]
+            if not isinstance(answer, str):
+                answer = json.dumps(answer)
             _working_model = model
             logger.info(f"Llama answered using {model}")
-            return response.choices[0].message.content.strip()
+            return answer.strip()
         except Exception as e:
             logger.warning(f"{model} failed: {e}")
             last_error = e
@@ -68,8 +83,8 @@ def _read_json(text: str) -> Dict:
 def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict], str]:
     """Step 1 for Llama: turn plain words like 'chill worship music'
     into genre, mood, energy and likes_acoustic for the scoring engine."""
-    if not _get_key():
-        return None, "Set HF_TOKEN to use plain-words search."
+    if not _has_keys():
+        return None, "Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to use plain-words search."
 
     genres = sorted(valid_genres)
     moods = sorted(valid_moods)
@@ -111,8 +126,8 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
 
 def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]]) -> str:
     """Step 2 for Llama: explain why these songs fit (RAG: only uses the retrieved songs)."""
-    if not _get_key():
-        return "[AI explanation unavailable: set HF_TOKEN to enable this feature]"
+    if not _has_keys():
+        return "[AI explanation unavailable: set the Cloudflare keys to enable this feature]"
 
     song_lines = []
     for i, (song, score, _) in enumerate(top_songs, 1):
