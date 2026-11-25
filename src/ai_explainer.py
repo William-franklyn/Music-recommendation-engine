@@ -1,66 +1,113 @@
+import json
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Meta's Llama, run for free by Groq
+MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-def get_ai_explanation(
-    user_prefs: Dict,
-    top_songs: List[Tuple[Dict, float, str]],
-    model: str = "claude-haiku-4-5-20251001",
-) -> str:
-    """
-    RAG generation layer: takes retrieved top-k songs and user preferences,
-    returns a Claude-generated natural language explanation.
-    Falls back gracefully if the API key is missing or the call fails.
-    """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set; skipping AI explanation")
-        return "[AI explanation unavailable: set ANTHROPIC_API_KEY in your .env file to enable this feature]"
+
+def _get_key() -> Optional[str]:
+    # Works on your computer (.env) and on Streamlit Cloud (Secrets)
+    key = os.getenv("GROQ_API_KEY")
+    if key:
+        return key
+    try:
+        import streamlit as st
+        return st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        return None
+
+
+def _ask_llama(prompt: str, max_tokens: int = 300, json_mode: bool = False) -> str:
+    from groq import Groq
+
+    client = Groq(api_key=_get_key())
+    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.2,
+        **extra,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict], str]:
+    """Step 1 for Llama: turn plain words like 'chill worship music'
+    into genre, mood, energy and likes_acoustic for the scoring engine."""
+    if not _get_key():
+        return None, "Set GROQ_API_KEY to use plain-words search."
+
+    genres = sorted(valid_genres)
+    moods = sorted(valid_moods)
+    prompt = (
+        "You turn a music request into settings for a song search engine.\n"
+        f"Request: \"{text}\"\n\n"
+        f"Pick genre from this list only: {genres}\n"
+        f"Pick mood from this list only: {moods}\n"
+        "energy is a number from 0.0 (very calm) to 1.0 (very intense).\n"
+        "likes_acoustic is true or false.\n"
+        "Worship or Christian music means genre \"gospel\".\n"
+        "Answer with JSON only, like: "
+        "{\"genre\": \"gospel\", \"mood\": \"chill\", \"energy\": 0.3, \"likes_acoustic\": true}"
+    )
+
+    try:
+        data = json.loads(_ask_llama(prompt, max_tokens=120, json_mode=True))
+    except Exception as e:
+        logger.error(f"Llama parse error: {e}")
+        return None, f"Llama couldn't read that request: {e}"
+
+    # Never trust the model blindly: check every value before using it
+    genre = str(data.get("genre", "pop")).strip().lower().replace("-", " ")
+    if genre not in valid_genres:
+        genre = "pop"
+    mood = str(data.get("mood", "chill")).strip().lower()
+    if mood not in valid_moods:
+        mood = "chill"
+    try:
+        energy = min(1.0, max(0.0, float(data.get("energy", 0.5))))
+    except (TypeError, ValueError):
+        energy = 0.5
+    likes_acoustic = str(data.get("likes_acoustic", False)).lower() == "true"
+
+    prefs = {"genre": genre, "mood": mood, "energy": energy, "likes_acoustic": likes_acoustic}
+    logger.info(f"Llama read '{text}' as {prefs}")
+    return prefs, ""
+
+
+def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]]) -> str:
+    """Step 2 for Llama: explain why these songs fit (RAG: only uses the retrieved songs)."""
+    if not _get_key():
+        return "[AI explanation unavailable: set GROQ_API_KEY to enable this feature]"
 
     song_lines = []
     for i, (song, score, _) in enumerate(top_songs, 1):
         song_lines.append(
             f"{i}. \"{song['title']}\" by {song['artist']} "
             f"(genre: {song['genre']}, mood: {song['mood']}, "
-            f"energy: {song['energy']:.2f}, "
-            f"acousticness: {song['acousticness']:.2f}, "
+            f"energy: {song['energy']:.2f}, acousticness: {song['acousticness']:.2f}, "
             f"match score: {score:.2f})"
         )
-    songs_context = "\n".join(song_lines)
-
-    user_context = (
-        f"Favorite genre: {user_prefs.get('genre', 'any')}, "
-        f"Favorite mood: {user_prefs.get('mood', 'any')}, "
-        f"Target energy level: {user_prefs.get('energy', 0.5):.1f}/1.0, "
-        f"Likes acoustic: {user_prefs.get('likes_acoustic', False)}"
-    )
 
     prompt = (
         "You are a friendly music recommendation assistant.\n\n"
-        f"A listener has these preferences:\n{user_context}\n\n"
-        f"Based on their preferences, the system retrieved and ranked these songs:\n{songs_context}\n\n"
-        "Write a short, conversational paragraph (3-4 sentences) explaining why these songs were chosen "
-        "for this listener. Be specific about the musical qualities that match their preferences. "
-        "Do not invent any song details — only reference what is listed above. Keep it warm and encouraging."
+        f"Listener wants: genre {user_prefs.get('genre')}, mood {user_prefs.get('mood')}, "
+        f"energy {user_prefs.get('energy', 0.5):.1f}/1.0, likes acoustic: {user_prefs.get('likes_acoustic', False)}\n\n"
+        "The system picked these songs:\n" + "\n".join(song_lines) + "\n\n"
+        "Write 3 to 4 warm sentences explaining why these songs fit. "
+        "Only use the details listed above. Do not invent anything."
     )
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=model,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        explanation = response.content[0].text.strip()
-        logger.info(f"Claude explanation generated ({len(explanation)} chars)")
-        return explanation
+        return _ask_llama(prompt, max_tokens=300)
     except Exception as e:
-        logger.error(f"Claude API error: {e}")
-        return f"[AI explanation unavailable: {str(e)}]"
+        logger.error(f"Llama explanation error: {e}")
+        return f"[AI explanation unavailable: {e}]"
