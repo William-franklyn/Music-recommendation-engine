@@ -4,3 +4,4 @@ streamlit
 anthropic
 python-dotenv
 groq
+huggingface_hub
