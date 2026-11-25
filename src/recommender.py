@@ -17,7 +17,18 @@ KAGGLE_COLUMNS = {
 }
 
 # The scoring weights (they add up to 1.0)
-WEIGHTS = {"genre": 0.35, "mood": 0.30, "energy": 0.25, "acoustic": 0.10}
+WEIGHTS = {"genre": 0.35, "mood": 0.25, "energy": 0.20, "acoustic": 0.05, "popularity": 0.15}
+
+# Where each mood sits on the (energy, valence) map. valence = how happy a song sounds.
+MOOD_TARGETS = {
+    "happy": (0.80, 0.80),
+    "intense": (0.85, 0.25),
+    "chill": (0.45, 0.55),
+    "relaxed": (0.30, 0.65),
+    "moody": (0.40, 0.20),
+    "focused": (0.40, 0.45),
+}
+MOOD_RANGE = 0.6  # songs farther than this from the mood's spot get 0 mood points
 
 
 def normalize_genre(name) -> str:
@@ -32,8 +43,7 @@ def _genre_pattern(genre: str) -> str:
 
 
 def mood_from_features(energy: float, valence: float, instrumentalness: float = 0.0) -> str:
-    # Spotify has no mood column, so we work it out from the numbers.
-    # valence = how happy a song sounds (0 to 1), energy = how intense (0 to 1)
+    # A simple label for each song, shown on screen
     if instrumentalness >= 0.5 and energy < 0.6:
         return "focused"
     if energy >= 0.7:
@@ -54,6 +64,16 @@ def _moods_for_table(df: pd.DataFrame) -> np.ndarray:
     )
 
 
+def mood_closeness(energy, valence, mood: str):
+    """NEW: partial mood points. 1.0 = right on the mood, 0.0 = far away.
+    Before, a song got all the mood points or none."""
+    target = MOOD_TARGETS.get(str(mood).lower())
+    if target is None:
+        return 0.0 * energy
+    distance = np.sqrt((energy - target[0]) ** 2 + (valence - target[1]) ** 2)
+    return np.clip(1.0 - distance / MOOD_RANGE, 0.0, 1.0)
+
+
 def genre_matches(song: Dict, user_prefs: Dict) -> bool:
     return re.search(_genre_pattern(user_prefs.get("genre", "")), normalize_genre(song["genre"])) is not None
 
@@ -62,13 +82,18 @@ def _build_rule_explanation(song: Dict, user_prefs: Dict, score: float) -> str:
     parts = []
     if genre_matches(song, user_prefs):
         parts.append(f"matches your favorite genre ({user_prefs.get('genre')})")
-    if str(song["mood"]).lower() == str(user_prefs.get("mood", "")).lower():
-        parts.append(f"fits your '{song['mood']}' mood")
+    closeness = float(mood_closeness(song["energy"], song.get("valence", 0.5), user_prefs.get("mood", "")))
+    if closeness >= 0.7:
+        parts.append(f"fits your '{user_prefs.get('mood')}' mood")
+    elif closeness >= 0.4:
+        parts.append(f"is close to your '{user_prefs.get('mood')}' mood")
     energy_diff = abs(song["energy"] - user_prefs.get("energy", 0.5))
     if energy_diff < 0.1:
         parts.append("has very close energy to your target")
     elif energy_diff < 0.2:
         parts.append("has similar energy to your target")
+    if song.get("popularity", 0) >= 60:
+        parts.append("is a popular song")
     if not parts:
         parts.append("is a reasonable match for your overall taste")
     confidence = "High" if score >= 0.7 else "Medium" if score >= 0.45 else "Low"
@@ -110,15 +135,18 @@ def score_table(user_prefs: Dict, df: pd.DataFrame) -> pd.Series:
     genre_score = (
         df["genre"].map(normalize_genre).str.contains(_genre_pattern(user_prefs.get("genre", "")), regex=True)
     ).astype(float)
-    mood_score = (df["mood"].astype(str).str.lower() == str(user_prefs.get("mood", "")).lower()).astype(float)
+    valence = df["valence"] if "valence" in df else 0.5
+    mood_score = mood_closeness(df["energy"], valence, user_prefs.get("mood", ""))
     energy_score = 1.0 - (df["energy"] - user_prefs.get("energy", 0.5)).abs()
     acoustic = df["acousticness"]
     acoustic_score = acoustic if user_prefs.get("likes_acoustic", False) else 1.0 - acoustic
+    popularity_score = (df["popularity"] / 100.0).clip(0, 1) if "popularity" in df else 0.0
 
     return (WEIGHTS["genre"] * genre_score +
             WEIGHTS["mood"] * mood_score +
             WEIGHTS["energy"] * energy_score +
-            WEIGHTS["acoustic"] * acoustic_score).round(4)
+            WEIGHTS["acoustic"] * acoustic_score +
+            WEIGHTS["popularity"] * popularity_score).round(4)
 
 
 def recommend_songs(
@@ -131,18 +159,20 @@ def recommend_songs(
 
     k = max(1, min(k, len(df)))
     scores = score_table(user_prefs, df)
-    popularity = df["popularity"] if "popularity" in df else pd.Series(0, index=df.index)
 
-    # Best score first. Scores within 0.01 of each other count as a tie,
-    # and in a tie the more popular song wins (so well-known songs come first).
-    order = pd.DataFrame({"band": scores.round(2), "popularity": popularity, "score": scores}).sort_values(
-        ["band", "popularity", "score"], ascending=False, kind="stable"
-    )
     top = []
-    for idx in order.index[:k]:
+    seen = set()
+    for idx in scores.sort_values(ascending=False, kind="stable").index:
         song = df.loc[idx].to_dict()
+        # Skip the same song twice (for example two versions of "Last Christmas")
+        key = (str(song["title"]).lower(), str(song["artist"]).lower())
+        if key in seen:
+            continue
+        seen.add(key)
         score = float(scores[idx])
         top.append((song, score, _build_rule_explanation(song, user_prefs, score)))
+        if len(top) == k:
+            break
 
     logger.info(f"Top result: '{top[0][0]['title']}' score={top[0][1]}")
     return top
