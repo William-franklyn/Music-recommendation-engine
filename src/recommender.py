@@ -1,12 +1,14 @@
 import logging
-from typing import List, Dict, Tuple
+import re
+from typing import Dict, List, Tuple, Union
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# The Kaggle Spotify file uses different column names, so we rename them
-# to the names the rest of the app already uses.
+# The older Kaggle file (114k songs) uses different column names,
+# so we rename them to the names the rest of the app uses.
 KAGGLE_COLUMNS = {
     "track_name": "title",
     "artists": "artist",
@@ -14,10 +16,19 @@ KAGGLE_COLUMNS = {
     "tempo": "tempo_bpm",
 }
 
+# The scoring weights (they add up to 1.0)
+WEIGHTS = {"genre": 0.35, "mood": 0.30, "energy": 0.25, "acoustic": 0.10}
+
 
 def normalize_genre(name) -> str:
-    # "indie-pop" and "Indie Pop" both become "indie pop"
-    return str(name).strip().lower().replace("-", " ")
+    # "Hip-Hop" becomes "hip hop", and "lofi" becomes "lo fi" (how Spotify writes it)
+    text = str(name).strip().lower().replace("-", " ")
+    return re.sub(r"\blofi\b", "lo fi", text)
+
+
+def _genre_pattern(genre: str) -> str:
+    # Matches the genre as whole words: "rock" finds "classic rock" but "rap" does not find "trap"
+    return r"(?<![a-z0-9])" + re.escape(normalize_genre(genre)) + r"(?![a-z0-9])"
 
 
 def mood_from_features(energy: float, valence: float, instrumentalness: float = 0.0) -> str:
@@ -32,26 +43,19 @@ def mood_from_features(energy: float, valence: float, instrumentalness: float = 
     return "chill" if valence >= 0.4 else "moody"
 
 
-def song_genres(song: Dict) -> List[str]:
-    # A song can have many genres, stored like "hip-hop, gospel"
-    return [normalize_genre(g) for g in str(song["genre"]).split(",")]
+def _moods_for_table(df: pd.DataFrame) -> np.ndarray:
+    # Same rules as mood_from_features, but for every song at once (much faster)
+    e, v = df["energy"], df["valence"]
+    i = df["instrumentalness"] if "instrumentalness" in df else 0.0
+    return np.select(
+        [(i >= 0.5) & (e < 0.6), (e >= 0.7) & (v >= 0.5), e >= 0.7, (e < 0.4) & (v >= 0.5), e < 0.4, v >= 0.4],
+        ["focused", "happy", "intense", "relaxed", "moody", "chill"],
+        default="moody",
+    )
 
 
 def genre_matches(song: Dict, user_prefs: Dict) -> bool:
-    return normalize_genre(user_prefs.get("genre", "")) in song_genres(song)
-
-
-def _score_song(song: Dict, user_prefs: Dict) -> float:
-    genre_score = 1.0 if genre_matches(song, user_prefs) else 0.0
-    mood_score = 1.0 if str(song["mood"]).lower() == str(user_prefs.get("mood", "")).lower() else 0.0
-    energy_score = 1.0 - abs(song["energy"] - user_prefs.get("energy", 0.5))
-    acoustic_raw = song["acousticness"]
-    acoustic_score = acoustic_raw if user_prefs.get("likes_acoustic", False) else (1.0 - acoustic_raw)
-
-    return (0.35 * genre_score +
-            0.30 * mood_score +
-            0.25 * energy_score +
-            0.10 * acoustic_score)
+    return re.search(_genre_pattern(user_prefs.get("genre", "")), normalize_genre(song["genre"])) is not None
 
 
 def _build_rule_explanation(song: Dict, user_prefs: Dict, score: float) -> str:
@@ -71,46 +75,74 @@ def _build_rule_explanation(song: Dict, user_prefs: Dict, score: float) -> str:
     return f"[Confidence: {confidence}] " + "; ".join(parts).capitalize() + "."
 
 
-def load_songs(csv_path: str) -> List[Dict]:
-    """Loads either the small songs.csv or the real Kaggle Spotify dataset."""
-    df = pd.read_csv(csv_path)
+def load_songs(path: str) -> Union[List[Dict], pd.DataFrame]:
+    """Loads the songs.
 
+    - data/songs.parquet: the big Spotify file (about 350,000 songs), returned as a table
+    - any .csv file: the small sample or the older Kaggle file, returned as a list of dicts
+    """
+    if path.endswith(".parquet"):
+        df = pd.read_parquet(path)
+        df["mood"] = _moods_for_table(df)
+        logger.info(f"Loaded {len(df)} songs from {path}")
+        return df
+
+    df = pd.read_csv(path)
     if "track_genre" in df.columns:
-        # Real Kaggle data: rename columns and drop empty rows
+        # Older Kaggle data: rename columns and drop empty rows
         df = df.rename(columns=KAGGLE_COLUMNS)
         df = df.dropna(subset=["title", "artist"])
-
-        # The same song can appear once per genre. Keep one row per song,
-        # but collect ALL of its genres, so "hip-hop" + "gospel" stays both.
+        # The same song can appear once per genre. Keep one row per song, with ALL its genres.
         all_genres = df.groupby("track_id")["genre"].agg(lambda g: ", ".join(dict.fromkeys(g)))
         df = df.drop_duplicates(subset="track_id").copy()
         df["genre"] = df["track_id"].map(all_genres)
         df["artist"] = df["artist"].str.replace(";", ", ")
         df["tempo_bpm"] = df["tempo_bpm"].round().astype(int)
-        df["mood"] = [
-            mood_from_features(e, v, i)
-            for e, v, i in zip(df["energy"], df["valence"], df["instrumentalness"])
-        ]
+        df["mood"] = _moods_for_table(df)
 
     songs = df.to_dict(orient="records")
-    logger.info(f"Loaded {len(songs)} songs from {csv_path}")
+    logger.info(f"Loaded {len(songs)} songs from {path}")
     return songs
 
 
-def recommend_songs(user_prefs: Dict, songs: List[Dict], k: int = 5) -> List[Tuple[Dict, float, str]]:
-    if not songs:
-        logger.warning("recommend_songs called with empty song list")
+def score_table(user_prefs: Dict, df: pd.DataFrame) -> pd.Series:
+    """The weighted sum, done for every song at once."""
+    genre_score = (
+        df["genre"].map(normalize_genre).str.contains(_genre_pattern(user_prefs.get("genre", "")), regex=True)
+    ).astype(float)
+    mood_score = (df["mood"].astype(str).str.lower() == str(user_prefs.get("mood", "")).lower()).astype(float)
+    energy_score = 1.0 - (df["energy"] - user_prefs.get("energy", 0.5)).abs()
+    acoustic = df["acousticness"]
+    acoustic_score = acoustic if user_prefs.get("likes_acoustic", False) else 1.0 - acoustic
+
+    return (WEIGHTS["genre"] * genre_score +
+            WEIGHTS["mood"] * mood_score +
+            WEIGHTS["energy"] * energy_score +
+            WEIGHTS["acoustic"] * acoustic_score).round(4)
+
+
+def recommend_songs(
+    user_prefs: Dict, songs: Union[List[Dict], pd.DataFrame], k: int = 5
+) -> List[Tuple[Dict, float, str]]:
+    df = songs if isinstance(songs, pd.DataFrame) else pd.DataFrame(songs)
+    if df.empty:
+        logger.warning("recommend_songs called with no songs")
         return []
 
-    k = max(1, min(k, len(songs)))
+    k = max(1, min(k, len(df)))
+    scores = score_table(user_prefs, df)
+    popularity = df["popularity"] if "popularity" in df else pd.Series(0, index=df.index)
 
-    scored = []
-    for song in songs:
-        score = _score_song(song, user_prefs)
-        scored.append((song, round(score, 4)))
+    # Best score first. Scores within 0.01 of each other count as a tie,
+    # and in a tie the more popular song wins (so well-known songs come first).
+    order = pd.DataFrame({"band": scores.round(2), "popularity": popularity, "score": scores}).sort_values(
+        ["band", "popularity", "score"], ascending=False, kind="stable"
+    )
+    top = []
+    for idx in order.index[:k]:
+        song = df.loc[idx].to_dict()
+        score = float(scores[idx])
+        top.append((song, score, _build_rule_explanation(song, user_prefs, score)))
 
-    # Best score first; popular songs win ties
-    scored.sort(key=lambda x: (x[1], x[0].get("popularity", 0)), reverse=True)
-    top = [(song, score, _build_rule_explanation(song, user_prefs, score)) for song, score in scored[:k]]
     logger.info(f"Top result: '{top[0][0]['title']}' score={top[0][1]}")
     return top
