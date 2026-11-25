@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -8,71 +9,67 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Meta's Llama, run for free by Groq.
-# Groq retires old model names, so we ask Groq which ones are live and pick a Llama.
-PREFERRED_MODELS = [
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+# Meta's Llama, run through Hugging Face Inference Providers.
+# We try these in order and remember the first one that answers.
+LLAMA_MODELS = [
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
 ]
-_chosen_model = None
+_working_model = None
 
 
 def _get_key() -> Optional[str]:
     # Works on your computer (.env) and on Streamlit Cloud (Secrets)
-    key = os.getenv("GROQ_API_KEY")
+    key = os.getenv("HF_TOKEN")
     if key:
         return key
     try:
         import streamlit as st
-        return st.secrets.get("GROQ_API_KEY")
+        return st.secrets.get("HF_TOKEN")
     except Exception:
         return None
 
 
-def _pick_model(client) -> str:
-    global _chosen_model
-    if _chosen_model:
-        return _chosen_model
-    forced = os.getenv("GROQ_MODEL")
-    if forced:
-        _chosen_model = forced
-        return forced
-    live = [m.id for m in client.models.list().data]
-    for name in PREFERRED_MODELS:
-        if name in live:
-            _chosen_model = name
-            break
-    else:
-        llamas = [m for m in live if "llama" in m.lower() and "guard" not in m.lower()]
-        if not llamas:
-            raise RuntimeError("Groq has no Llama chat model available right now")
-        _chosen_model = llamas[0]
-    logger.info(f"Using Groq model {_chosen_model}")
-    return _chosen_model
+def _ask_llama(prompt: str, max_tokens: int = 300) -> str:
+    global _working_model
+    from huggingface_hub import InferenceClient
+
+    client = InferenceClient(api_key=_get_key())
+    models = ([_working_model] if _working_model else []) + [
+        m for m in LLAMA_MODELS if m != _working_model
+    ]
+    last_error = None
+    for model in models:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.2,
+            )
+            _working_model = model
+            logger.info(f"Llama answered using {model}")
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"{model} failed: {e}")
+            last_error = e
+    raise RuntimeError(f"No Llama model answered. Last error: {last_error}")
 
 
-def _ask_llama(prompt: str, max_tokens: int = 300, json_mode: bool = False) -> str:
-    from groq import Groq
-
-    client = Groq(api_key=_get_key())
-    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
-    response = client.chat.completions.create(
-        model=_pick_model(client),
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=0.2,
-        **extra,
-    )
-    return response.choices[0].message.content.strip()
+def _read_json(text: str) -> Dict:
+    # Pulls the {...} part out of the model's reply
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON in reply: {text[:200]}")
+    return json.loads(match.group(0))
 
 
 def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict], str]:
     """Step 1 for Llama: turn plain words like 'chill worship music'
     into genre, mood, energy and likes_acoustic for the scoring engine."""
     if not _get_key():
-        return None, "Set GROQ_API_KEY to use plain-words search."
+        return None, "Set HF_TOKEN to use plain-words search."
 
     genres = sorted(valid_genres)
     moods = sorted(valid_moods)
@@ -84,12 +81,12 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
         "energy is a number from 0.0 (very calm) to 1.0 (very intense).\n"
         "likes_acoustic is true or false.\n"
         "Worship or Christian music means genre \"gospel\".\n"
-        "Answer with JSON only, like: "
+        "Answer with JSON only and nothing else, like: "
         "{\"genre\": \"gospel\", \"mood\": \"chill\", \"energy\": 0.3, \"likes_acoustic\": true}"
     )
 
     try:
-        data = json.loads(_ask_llama(prompt, max_tokens=120, json_mode=True))
+        data = _read_json(_ask_llama(prompt, max_tokens=120))
     except Exception as e:
         logger.error(f"Llama parse error: {e}")
         return None, f"Llama couldn't read that request: {e}"
@@ -115,7 +112,7 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
 def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]]) -> str:
     """Step 2 for Llama: explain why these songs fit (RAG: only uses the retrieved songs)."""
     if not _get_key():
-        return "[AI explanation unavailable: set GROQ_API_KEY to enable this feature]"
+        return "[AI explanation unavailable: set HF_TOKEN to enable this feature]"
 
     song_lines = []
     for i, (song, score, _) in enumerate(top_songs, 1):
