@@ -24,7 +24,7 @@ def get_songs(path):
 
 
 st.set_page_config(page_title="VibeFinder", page_icon="🎵", layout="wide")
-st.title("VibeFinder — AI Music Recommender")
+st.title("VibeFinder: AI Music Recommender")
 st.caption("Powered by a weighted scoring engine on real Spotify data + Claude AI explanations (RAG)")
 
 songs = get_songs(DATA_PATH)
@@ -66,7 +66,7 @@ if run_btn:
         badge_color = {"High": "green", "Medium": "orange", "Low": "red"}[confidence]
 
         with st.expander(
-            f"#{rank} — {song['title']} by {song['artist']}  |  Score: {score:.2f}",
+            f"#{rank}: {song['title']} by {song['artist']}  |  Score: {score:.2f}",
             expanded=(rank == 1),
         ):
             col1, col2 = st.columns([2, 1])
