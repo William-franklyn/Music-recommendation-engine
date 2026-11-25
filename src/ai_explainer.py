@@ -8,8 +8,15 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Meta's Llama, run for free by Groq
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Meta's Llama, run for free by Groq.
+# Groq retires old model names, so we ask Groq which ones are live and pick a Llama.
+PREFERRED_MODELS = [
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+_chosen_model = None
 
 
 def _get_key() -> Optional[str]:
@@ -24,13 +31,35 @@ def _get_key() -> Optional[str]:
         return None
 
 
+def _pick_model(client) -> str:
+    global _chosen_model
+    if _chosen_model:
+        return _chosen_model
+    forced = os.getenv("GROQ_MODEL")
+    if forced:
+        _chosen_model = forced
+        return forced
+    live = [m.id for m in client.models.list().data]
+    for name in PREFERRED_MODELS:
+        if name in live:
+            _chosen_model = name
+            break
+    else:
+        llamas = [m for m in live if "llama" in m.lower() and "guard" not in m.lower()]
+        if not llamas:
+            raise RuntimeError("Groq has no Llama chat model available right now")
+        _chosen_model = llamas[0]
+    logger.info(f"Using Groq model {_chosen_model}")
+    return _chosen_model
+
+
 def _ask_llama(prompt: str, max_tokens: int = 300, json_mode: bool = False) -> str:
     from groq import Groq
 
     client = Groq(api_key=_get_key())
     extra = {"response_format": {"type": "json_object"}} if json_mode else {}
     response = client.chat.completions.create(
-        model=MODEL,
+        model=_pick_model(client),
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=0.2,
