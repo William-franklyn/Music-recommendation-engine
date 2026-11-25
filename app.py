@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ai_explainer import get_ai_explanation
 from guardrails import VALID_GENRES, VALID_MOODS, validate_user_prefs
@@ -12,13 +13,27 @@ from recommender import load_songs, recommend_songs
 
 setup_logging()
 
+# Use the real Spotify dataset if it's there, otherwise the small sample file
+DATA_PATH = "data/dataset.csv" if os.path.exists("data/dataset.csv") else "data/songs.csv"
+
+
+@st.cache_data(show_spinner="Loading songs...")
+def get_songs(path):
+    # Loads the songs once, then reuses them on every click
+    return load_songs(path)
+
+
 st.set_page_config(page_title="VibeFinder", page_icon="🎵", layout="wide")
 st.title("VibeFinder — AI Music Recommender")
-st.caption("Powered by a weighted scoring engine + Claude AI explanations (RAG)")
+st.caption("Powered by a weighted scoring engine on real Spotify data + Claude AI explanations (RAG)")
+
+songs = get_songs(DATA_PATH)
 
 with st.sidebar:
     st.header("Your Taste Profile")
-    genre = st.selectbox("Favorite Genre", sorted(VALID_GENRES))
+    st.caption(f"Searching {len(songs):,} songs")
+    genres = sorted(VALID_GENRES)
+    genre = st.selectbox("Favorite Genre", genres, index=genres.index("pop") if "pop" in genres else 0)
     mood = st.selectbox("Favorite Mood", sorted(VALID_MOODS))
     energy = st.slider(
         "Target Energy Level", 0.0, 1.0, 0.7, step=0.05,
@@ -42,7 +57,6 @@ if run_btn:
         st.error(f"Input error: {err}")
         st.stop()
 
-    songs = load_songs("data/songs.csv")
     results = recommend_songs(user_prefs, songs, k=k)
 
     st.subheader(f"Top {len(results)} Recommendations for You")
@@ -67,6 +81,12 @@ if run_btn:
                     f"**Danceability:** {song['danceability']:.2f}"
                 )
                 st.write(f"**Why this song:** {rule_explanation}")
+                if song.get("track_id"):
+                    # Free Spotify player: plays a preview, or the full song if logged in
+                    components.iframe(
+                        f"https://open.spotify.com/embed/track/{song['track_id']}",
+                        height=80,
+                    )
             with col2:
                 st.markdown(f"**Confidence:** :{badge_color}[{confidence}]")
                 st.metric("Match Score", f"{score:.2f}")
