@@ -8,6 +8,7 @@ import streamlit.components.v1 as components
 
 import ai_explainer
 from ai_explainer import get_ai_explanation, parse_request
+from data_source import get_songs_path
 from guardrails import VALID_GENRES, VALID_MOODS, validate_user_prefs
 from logger_config import setup_logging
 from rate_limiter import check_daily, check_visitor
@@ -17,14 +18,13 @@ setup_logging()
 
 APP_NAME = "Music Recommendation Engine"
 
-# Use the real Spotify dataset if it's there, otherwise the small sample file
-DATA_PATH = "data/songs.parquet" if os.path.exists("data/songs.parquet") else "data/songs.csv"
 
-
-@st.cache_data(show_spinner="Loading songs...")
-def get_songs(path):
-    # Loads the songs once, then reuses them on every click
-    return load_songs(path)
+@st.cache_data(show_spinner="Loading songs...", ttl=24 * 60 * 60)
+def get_songs():
+    # Gets the songs from AWS S3 (or the repo copy if S3 is not set up or fails).
+    # Runs once, then the result is reused for 24 hours.
+    path, source = get_songs_path()
+    return load_songs(path), source
 
 
 def show_source():
@@ -50,7 +50,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="🎵", layout="wide")
 st.title(APP_NAME)
 st.caption("Meta's Llama reads your request, a weighted scoring engine searches real Spotify data, and Llama explains the picks")
 
-songs = get_songs(DATA_PATH)
+songs, songs_source = get_songs()
 
 # ---------- Option 1: type what you want ----------
 request = st.text_input(
@@ -62,7 +62,7 @@ ask_btn = st.button("Ask Llama", type="primary")
 # ---------- Option 2: pick it yourself ----------
 with st.sidebar:
     st.header("Or set it yourself")
-    st.caption(f"Searching {len(songs):,} songs")
+    st.caption(f"Searching {len(songs):,} songs · data from {songs_source}")
     genres = sorted(VALID_GENRES)
     genre = st.selectbox("Favorite Genre", genres, index=genres.index("pop") if "pop" in genres else 0)
     mood = st.selectbox("Favorite Mood", sorted(VALID_MOODS))
@@ -133,8 +133,10 @@ if user_prefs:
                 )
                 st.write(f"**Why this song:** {rule_explanation}")
                 if song.get("track_id"):
-                    # Free Spotify player: plays a preview, or the full song if logged in
-                    components.iframe(
+                    # Free Spotify player: plays a preview, or the full song if logged in.
+                    # st.iframe is the new name; older Streamlit versions only have components.iframe.
+                    player = getattr(st, "iframe", None) or components.iframe
+                    player(
                         f"https://open.spotify.com/embed/track/{song['track_id']}",
                         height=80,
                     )
