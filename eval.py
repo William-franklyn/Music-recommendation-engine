@@ -56,7 +56,7 @@ PROFILES = [
 GUARDRAIL_CASES = [
     {"genre": "pop",   "mood": "happy", "energy": 1.5,  "likes_acoustic": False},  # energy out of range
     {"genre": "",      "mood": "chill", "energy": 0.5,  "likes_acoustic": False},  # missing genre
-    {"genre": "metal", "mood": "happy", "energy": 0.8,  "likes_acoustic": False},  # invalid genre
+    {"genre": "space polka", "mood": "happy", "energy": 0.8,  "likes_acoustic": False},  # invalid genre
     {"genre": "lofi",  "mood": "",      "energy": 0.4,  "likes_acoustic": True},   # missing mood
 ]
 
