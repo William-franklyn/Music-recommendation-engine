@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -10,14 +11,17 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Meta's Llama, run by Cloudflare Workers AI (free daily limit).
-# We try these in order and remember the first one that answers.
+# Plan A: our own Llama 3.2 3B running in Google Colab (link saved in Redis).
+# Plan B: Meta's Llama on Cloudflare Workers AI (free daily limit).
+REDIS_KEY = "vibefinder_llama_url"
 LLAMA_MODELS = [
     "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "@cf/meta/llama-3.1-8b-instruct",
     "@cf/meta/llama-3.2-3b-instruct",
 ]
 _working_model = None
+_colab_cache = {"url": None, "checked": 0.0}
+last_source = "none"  # which Llama answered last: "Colab (self-hosted)" or "Cloudflare"
 
 
 def _get_secret(name: str) -> Optional[str]:
@@ -32,15 +36,49 @@ def _get_secret(name: str) -> Optional[str]:
         return None
 
 
-def _has_keys() -> bool:
+def _has_cloudflare() -> bool:
     return bool(_get_secret("CLOUDFLARE_API_TOKEN") and _get_secret("CLOUDFLARE_ACCOUNT_ID"))
 
 
-def _ask_llama(prompt: str, max_tokens: int = 300) -> str:
+def _has_keys() -> bool:
+    return _has_cloudflare() or bool(_colab_url())
+
+
+def _colab_url() -> Optional[str]:
+    """Reads the Colab link from Redis. Checks at most every 30 seconds."""
+    kv_url = _get_secret("KV_REST_API_URL")
+    kv_token = _get_secret("KV_REST_API_TOKEN")
+    if not (kv_url and kv_token):
+        return None
+    if time.time() - _colab_cache["checked"] < 30:
+        return _colab_cache["url"]
+    try:
+        r = requests.post(kv_url, headers={"Authorization": f"Bearer {kv_token}"},
+                          json=["GET", REDIS_KEY], timeout=5)
+        _colab_cache["url"] = r.json().get("result")
+    except Exception as e:
+        logger.warning(f"Could not read Colab link from Redis: {e}")
+        _colab_cache["url"] = None
+    _colab_cache["checked"] = time.time()
+    return _colab_cache["url"]
+
+
+def _ask_colab(prompt: str, max_tokens: int) -> str:
+    url = _colab_url()
+    if not url:
+        raise RuntimeError("Colab Llama is off")
+    r = requests.post(f"{url}/chat", json={
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    }, timeout=45)
+    r.raise_for_status()
+    return r.json()["response"].strip()
+
+
+def _ask_cloudflare(prompt: str, max_tokens: int) -> str:
     global _working_model
     account = _get_secret("CLOUDFLARE_ACCOUNT_ID")
     token = _get_secret("CLOUDFLARE_API_TOKEN")
-
     models = ([_working_model] if _working_model else []) + [
         m for m in LLAMA_MODELS if m != _working_model
     ]
@@ -64,12 +102,29 @@ def _ask_llama(prompt: str, max_tokens: int = 300) -> str:
             if not isinstance(answer, str):
                 answer = json.dumps(answer)
             _working_model = model
-            logger.info(f"Llama answered using {model}")
+            logger.info(f"Cloudflare answered using {model}")
             return answer.strip()
         except Exception as e:
             logger.warning(f"{model} failed: {e}")
             last_error = e
-    raise RuntimeError(f"No Llama model answered. Last error: {last_error}")
+    raise RuntimeError(f"No Cloudflare model answered. Last error: {last_error}")
+
+
+def _ask_llama(prompt: str, max_tokens: int = 300) -> str:
+    """Tries our own Colab Llama first, then falls back to Cloudflare automatically."""
+    global last_source
+    try:
+        answer = _ask_colab(prompt, max_tokens)
+        last_source = "Colab (self-hosted)"
+        logger.info("Colab Llama answered")
+        return answer
+    except Exception as e:
+        logger.info(f"Colab not used ({e}), falling back to Cloudflare")
+    if not _has_cloudflare():
+        raise RuntimeError("Colab is off and Cloudflare keys are missing")
+    answer = _ask_cloudflare(prompt, max_tokens)
+    last_source = "Cloudflare"
+    return answer
 
 
 def _read_json(text: str) -> Dict:
@@ -81,10 +136,10 @@ def _read_json(text: str) -> Dict:
 
 
 def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict], str]:
-    """Step 1 for Llama: turn plain words like 'chill worship music'
-    into genre, mood, energy and likes_acoustic for the scoring engine."""
+    """Step 1 for Llama: turn plain words like 'chill worship music' into
+    genre, mood, energy and likes_acoustic for the scoring engine."""
     if not _has_keys():
-        return None, "Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to use plain-words search."
+        return None, "Set the Cloudflare keys (or start the Colab Llama) to use plain-words search."
 
     genres = sorted(valid_genres)
     moods = sorted(valid_moods)
@@ -99,7 +154,6 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
         "Answer with JSON only and nothing else, like: "
         "{\"genre\": \"gospel\", \"mood\": \"chill\", \"energy\": 0.3, \"likes_acoustic\": true}"
     )
-
     try:
         data = _read_json(_ask_llama(prompt, max_tokens=120))
     except Exception as e:
@@ -120,14 +174,14 @@ def parse_request(text: str, valid_genres, valid_moods) -> Tuple[Optional[Dict],
     likes_acoustic = str(data.get("likes_acoustic", False)).lower() == "true"
 
     prefs = {"genre": genre, "mood": mood, "energy": energy, "likes_acoustic": likes_acoustic}
-    logger.info(f"Llama read '{text}' as {prefs}")
+    logger.info(f"Llama ({last_source}) read '{text}' as {prefs}")
     return prefs, ""
 
 
 def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]]) -> str:
     """Step 2 for Llama: explain why these songs fit (RAG: only uses the retrieved songs)."""
     if not _has_keys():
-        return "[AI explanation unavailable: set the Cloudflare keys to enable this feature]"
+        return "[AI explanation unavailable: set the Cloudflare keys or start the Colab Llama]"
 
     song_lines = []
     for i, (song, score, _) in enumerate(top_songs, 1):
@@ -137,7 +191,6 @@ def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]
             f"energy: {song['energy']:.2f}, acousticness: {song['acousticness']:.2f}, "
             f"match score: {score:.2f})"
         )
-
     prompt = (
         "You are a friendly music recommendation assistant.\n\n"
         f"Listener wants: genre {user_prefs.get('genre')}, mood {user_prefs.get('mood')}, "
@@ -146,7 +199,6 @@ def get_ai_explanation(user_prefs: Dict, top_songs: List[Tuple[Dict, float, str]
         "Write 3 to 4 warm sentences explaining why these songs fit. "
         "Only use the details listed above. Do not invent anything."
     )
-
     try:
         return _ask_llama(prompt, max_tokens=300)
     except Exception as e:
