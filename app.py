@@ -10,6 +10,7 @@ import ai_explainer
 from ai_explainer import get_ai_explanation, parse_request
 from guardrails import VALID_GENRES, VALID_MOODS, validate_user_prefs
 from logger_config import setup_logging
+from rate_limiter import check_daily, check_visitor
 from recommender import load_songs, recommend_songs
 
 setup_logging()
@@ -29,6 +30,18 @@ def show_source():
     source = ai_explainer.last_source
     icon = "🖥️" if source.startswith("Colab") else "☁️"
     st.caption(f"{icon} Answered by: **{source}**")
+
+
+def llama_allowed() -> bool:
+    # Rate limits: 5 requests per visitor per minute, 200 per day for the whole app
+    ok, wait = check_visitor(st.session_state)
+    if not ok:
+        st.warning(f"Slow down a little. You can ask Llama again in {wait} seconds. The sidebar search still works.")
+        return False
+    if not check_daily():
+        st.warning("VibeFinder reached its Llama limit for today. Please try tomorrow, or use the sidebar search.")
+        return False
+    return True
 
 
 st.set_page_config(page_title="VibeFinder", page_icon="🎵", layout="wide")
@@ -60,11 +73,15 @@ with st.sidebar:
     run_btn = st.button("Find My Songs")
 
 user_prefs = None
+llama_checked = False  # so one button press counts as one request
 
 if ask_btn:
     if not request.strip():
         st.warning("Type what you want to hear first.")
         st.stop()
+    if not llama_allowed():
+        st.stop()
+    llama_checked = True
     with st.spinner("Llama is reading your request..."):
         user_prefs, err = parse_request(request, VALID_GENRES, VALID_MOODS)
     if user_prefs is None:
@@ -123,7 +140,7 @@ if user_prefs:
                 st.markdown(f"**Confidence:** :{badge_color}[{confidence}]")
                 st.metric("Match Score", f"{score:.2f}")
 
-    if use_ai:
+    if use_ai and (llama_checked or llama_allowed()):
         st.divider()
         st.subheader("Llama's Take on Your Playlist")
         with st.spinner("Asking Llama..."):
