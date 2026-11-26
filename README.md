@@ -1,307 +1,210 @@
-# VibeFinder — AI Music Recommender
+# 🎵 Music Recommendation Engine
 
-**Base project:** Music Recommender Simulation (Module 3)
+**Describe a vibe in plain words and get real songs that match it.**
 
-The original project scaffolded a rule-based music recommender with `Song` and `UserProfile` dataclasses and stub functions for loading songs, scoring, and generating explanations. This final project fully implements and extends that system into a complete applied AI application featuring a Streamlit UI, Claude API RAG integration, structured logging, input guardrails, and a 7-test automated test suite.
+[**Try the live app**](https://music-recommendation-engineai.streamlit.app/) · [Watch the demo (earlier version)](https://www.loom.com/share/2db33ebdefe9455abf95830b8e742faf)
 
----
-
-## Demo Walkthrough
-
-> **Loom video:** [Watch the demo](https://www.loom.com/share/2db33ebdefe9455abf95830b8e742faf)
+![Tests](https://github.com/William-franklyn/music-recommendation-engine/actions/workflows/tests.yml/badge.svg)
 
 ---
 
-## System Architecture
+## The problem
+
+People describe music by feeling: *"chill worship music for a rainy night."* Most apps make you search by song or artist names. New users have no listening history (the **cold start problem**), and recommendations rarely explain themselves, so they are hard to trust.
+
+This engine takes plain words, searches about **350,000 real Spotify songs**, and explains every pick.
+
+---
+
+## System architecture
 
 ```mermaid
 flowchart TD
-    H["👤 User Preferences\nfavorite_genre · favorite_mood\ntarget_energy 0–1 · likes_acoustic"] --> A
-    A["🎵 Streamlit UI\napp.py\nSidebar controls · Results display\nConfidence badges"] --> E
-    A --> B
-    G["📂 Data\ndata/songs.csv\n10 songs · 6 genres · 6 moods"] --> B
-    B["🔍 Retrieval Layer\nsrc/recommender.py\nload_songs · _score_song\nrecommend_songs → top-k ranked"] --> C
-    B --> E
-    C["🤖 Generation Layer — RAG\nsrc/ai_explainer.py\nGrounded prompt from retrieved songs\nClaude API call · Graceful fallback"] --> A
-    E["🛡️ Guardrails + Logging\nguardrails.py · logger_config.py\nValidate inputs · JSON-lines log"]
+    H["👤 User<br/>types a vibe in plain words<br/>or sets genre · mood · energy"] --> A
+    A["🎵 Streamlit UI<br/>app.py<br/>Ask Llama · sidebar search<br/>Spotify player · confidence badges"] --> R
+    R["🚦 Rate limiter<br/>src/rate_limiter.py<br/>5 per visitor per minute<br/>200 per day for the whole app"] --> L
+    L["🦙 Llama: understand the request<br/>src/ai_explainer.py<br/>words → genre · mood · energy · acoustic"] --> E
+    E["🛡️ Guardrails<br/>src/guardrails.py<br/>check every value Llama returns"] --> B
+    A -->|sidebar search| E
+    G["📂 Data<br/>data/songs.parquet<br/>~350,000 Spotify songs · 229 genres"] --> B
+    B["🔍 Scoring engine<br/>src/recommender.py<br/>weighted score for every song at once<br/>top-k · no duplicates"] --> C
+    C["🤖 Llama: explain the picks (RAG)<br/>uses only the songs that were found"] --> A
 
     style H fill:#DDA0DD,color:#000
     style A fill:#4A90D9,color:#fff
+    style R fill:#FFB347,color:#000
+    style L fill:#50C878,color:#000
+    style E fill:#FF6B6B,color:#fff
+    style G fill:#87CEEB,color:#000
     style B fill:#7B68EE,color:#fff
     style C fill:#50C878,color:#000
-    style G fill:#87CEEB,color:#000
-    style E fill:#FF6B6B,color:#fff
 ```
 
-*Diagram source: [assets/architecture.mmd](assets/architecture.mmd)*
+1. **Llama reads your request** and turns it into settings: genre, mood, energy, and acoustic or not.
+2. **Guardrails check the answer** against the real list of genres and moods. The model is never trusted blindly.
+3. **The scoring engine ranks every song at once** with pandas and NumPy, in about 0.5 seconds.
+4. **Llama explains the picks** using only the songs that were found (retrieval augmented generation), so it can't make up facts.
+5. **You listen right away** with a built-in Spotify player.
 
-**AI Feature: Retrieval-Augmented Generation (RAG)**
-1. **Retrieval** — the recommender scores all 10 songs using a weighted feature match (genre 35%, mood 30%, energy proximity 25%, acousticness 10%) and returns the top-k matches.
-2. **Generation** — the retrieved song data is injected into a Claude prompt, which writes a natural language explanation grounded only in those songs. Claude cannot hallucinate titles or attributes because all data comes from the retrieval step.
+You can also skip Llama and set everything yourself in the sidebar.
 
 ---
 
-## How the System Works
+## Self-hosted Llama with automatic fallback
 
-Each song entry has: title, artist, genre, mood, energy (0–1), tempo (BPM), valence, danceability, acousticness.
+The app can use two Llamas. It always tries my own first.
 
-Each user profile has: favorite genre, favorite mood, target energy level (0–1), and acoustic preference.
+```mermaid
+flowchart LR
+    App["🎵 Streamlit app"] --> Q{"🔑 Colab link<br/>in Redis?"}
+    Q -->|yes| Colab["🖥️ Plan A<br/>my Llama 3.2 3B<br/>Colab T4 GPU · FastAPI<br/>Cloudflare Tunnel"]
+    Q -->|no| CF["☁️ Plan B<br/>Llama on<br/>Cloudflare Workers AI"]
+    Colab -->|answer| App
+    Colab -.->|off, slow or error| CF
+    CF -->|answer| App
+    NB["📓 Colab notebook"] -->|saves link every 60 s<br/>expires after 120 s| Redis[("🗄️ Upstash Redis")]
+    Redis --> Q
 
-The scoring algorithm computes a weighted sum:
+    style App fill:#4A90D9,color:#fff
+    style Q fill:#FFB347,color:#000
+    style Colab fill:#50C878,color:#000
+    style CF fill:#87CEEB,color:#000
+    style NB fill:#DDA0DD,color:#000
+    style Redis fill:#FF6B6B,color:#fff
+```
 
-| Feature | Weight | Logic |
+- **Plan A: my own Llama 3.2 3B** runs on a Google Colab T4 GPU, served with FastAPI and reached through a Cloudflare tunnel. The notebook saves its public link in Upstash Redis every minute, and the link expires after 2 minutes, so when the notebook stops, the app knows right away.
+- **Plan B: Llama on Cloudflare Workers AI.** If Colab is off, slow, or broken, the app switches over automatically. It tries several models in order and remembers the one that works.
+
+The app shows which one answered: **Colab (self-hosted)** or **Cloudflare**. The server notebook is [`music_recommendation_engine.ipynb`](music_recommendation_engine.ipynb).
+
+---
+
+## The scoring formula
+
+| Part | Weight | How it is scored |
 |---|---|---|
-| Genre match | 35% | 1.0 if exact match, else 0.0 |
-| Mood match | 30% | 1.0 if exact match, else 0.0 |
-| Energy proximity | 25% | `1.0 - abs(song_energy - target_energy)` |
-| Acoustic preference | 10% | acousticness if prefers acoustic, else inverse |
+| Genre | 35% | Whole-word match: "rock" matches "classic rock," but "rap" does not match "trap" |
+| Mood | 25% | Partial points: the closer a song is to the mood's spot on an energy and happiness map, the more points |
+| Energy | 20% | `1 - abs(song_energy - target_energy)` |
+| Popularity | 15% | Breaks near-ties toward songs people actually know |
+| Acoustic | 5% | Acousticness if you like acoustic sound, otherwise the opposite |
 
-Confidence labels: **High** (score ≥ 0.7) · **Medium** (≥ 0.45) · **Low** (< 0.45).
+```mermaid
+quadrantChart
+    title Mood map
+    x-axis Low energy --> High energy
+    y-axis Sad sounding --> Happy sounding
+    quadrant-1 Upbeat
+    quadrant-2 Calm and bright
+    quadrant-3 Calm and dark
+    quadrant-4 Heavy
+    happy: [0.80, 0.80]
+    intense: [0.85, 0.25]
+    chill: [0.45, 0.55]
+    relaxed: [0.30, 0.65]
+    moody: [0.40, 0.20]
+    focused: [0.40, 0.45]
+```
+
+The same song is never shown twice. Every result shows a confidence level (**High** ≥ 0.7, **Medium** ≥ 0.45, **Low** below that) and a plain-English reason.
+
+**Why partial mood points?** With all-or-nothing moods, calm English worship songs were labeled "moody" (they sound a little sad) and got zero points in a "chill" search. Measuring distance on the mood map fixed that.
 
 ---
 
-## Getting Started
+## Engineering
 
-### Prerequisites
+```mermaid
+flowchart LR
+    P["💻 git push"] --> T["🧪 Job 1: test<br/>pip install · pytest"]
+    T -->|pass| D["🐳 Job 2: docker<br/>build image (cached)"]
+    D --> DT["🧪 pytest inside<br/>the container"]
+    DT --> HC["❤️ start app<br/>health check"]
+    HC --> OK["✅ green check"]
+    P --> S["🚀 Streamlit Cloud<br/>redeploys the live app"]
 
-- Python 3.9+
-- An Anthropic (Claude) API key (optional — the app works without one; AI explanations are disabled gracefully)
+    style P fill:#DDA0DD,color:#000
+    style T fill:#7B68EE,color:#fff
+    style D fill:#4A90D9,color:#fff
+    style DT fill:#7B68EE,color:#fff
+    style HC fill:#FF6B6B,color:#fff
+    style OK fill:#50C878,color:#000
+    style S fill:#87CEEB,color:#000
+```
 
-### Setup
+- **CI:** GitHub Actions runs the pytest tests on every push and pull request.
+- **Docker:** CI builds the image with layer caching, runs the tests inside it, and checks that the app starts and passes a health check.
+- **Rate limiting:** 5 Llama requests per visitor per minute (sliding window), and 200 per day for the whole app, counted in Redis. If Redis is down, the app keeps working instead of blocking people. The sidebar search never uses Llama, so it always works.
+- **Fast data:** songs are stored as compressed Parquet (15 MB) and cached, so they load in about 0.1 seconds.
+- **Logging:** JSON-lines logs for every request, including which Llama answered.
 
-1. Clone the repository and move into the project folder — all later commands assume you're standing inside this folder:
+---
 
-   ```bash
-   git clone https://github.com/William-franklyn/Music-recommendation-system-with-AI.git
-   cd Music-recommendation-system-with-AI
-   ```
+## The data
 
-2. Create a virtual environment (recommended):
+The songs come from the Kaggle dataset [Spotify Dataset 1921-2020, 600k+ Tracks](https://www.kaggle.com/datasets/yamaerenay/spotify-dataset-19212020-600k-tracks). I joined each song with its artists' genres, removed podcasts and audiobooks, kept songs with popularity of 20 or more, and tagged Christmas songs by title (words like "Christmas," "Jingle Bell" and "Silent Night"). That leaves **347,778 songs**.
 
-   ```bash
-   python -m venv .venv
-   ```
+An earlier version used a smaller 114,000-song dataset. It had only about 1,000 gospel songs, almost all Brazilian, and no Christmas genre at all, so searches like "Christmas music" returned unrelated songs. Switching data fixed that.
 
-3. Activate it. **You must do this every time you open a new terminal**, before installing or running anything — activation doesn't persist across terminal sessions:
+---
 
-   | Shell | Command |
-   |---|---|
-   | macOS/Linux (bash/zsh) | `source .venv/bin/activate` |
-   | Windows (PowerShell) | `.venv\Scripts\Activate.ps1` |
-   | Windows (cmd.exe) | `.venv\Scripts\activate.bat` |
+## Run it yourself
 
-   You'll know it worked when your prompt is prefixed with `(.venv)`.
-
-   **Windows PowerShell only:** if activation fails with *"running scripts is disabled on this system,"* run this once (no admin rights needed), then retry:
-   ```powershell
-   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-   ```
-
-4. Install dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-5. (Optional) Create a `.env` file in the project root to enable Claude AI explanations:
-
-   ```
-   ANTHROPIC_API_KEY=your_key_here
-   ```
-
-   Get a key at [console.anthropic.com](https://console.anthropic.com). Never commit this file — it's already excluded via `.gitignore`.
-
-### Running the Streamlit UI
+With Docker:
 
 ```bash
+git clone https://github.com/William-franklyn/music-recommendation-engine.git
+cd music-recommendation-engine
+docker build -t music-engine .
+docker run -p 8501:8501 music-engine
+```
+
+Then open http://localhost:8501.
+
+Without Docker:
+
+```bash
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Run this from inside the project folder (the one containing `app.py`). If you see `File does not exist: app.py`, you're in the wrong directory — `cd` into the project folder first.
+Song search works without any keys. For Llama, put these in a `.env` file (and run Docker with `--env-file .env`):
 
-Open the browser URL shown in the terminal (usually `http://localhost:8501`). Use the sidebar to set your preferences and click **Find My Songs**.
-
-### Running the CLI
-
-```bash
-python -m src.main
+```
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_ACCOUNT_ID=...
+KV_REST_API_URL=...        # optional: self-hosted Llama and the daily limit
+KV_REST_API_TOKEN=...
 ```
 
-### Running Tests
+Run the tests and the evaluation:
 
 ```bash
-pytest
-```
-
-All 7 tests pass without an API key.
-
-To run any single test in isolation, use `pytest <file>::<test_name>`:
-
-```bash
-pytest tests/test_recommender.py::test_recommend_returns_songs_sorted_by_score -v
-pytest tests/test_recommender.py::test_explain_recommendation_returns_non_empty_string -v
-pytest tests/test_recommender.py::test_load_songs_returns_list_of_dicts -v
-pytest tests/test_recommender.py::test_recommend_songs_respects_k -v
-pytest tests/test_recommender.py::test_recommend_songs_sorted_descending -v
-pytest tests/test_recommender.py::test_guardrail_rejects_invalid_energy -v
-pytest tests/test_recommender.py::test_explain_recommendation_contains_confidence -v
-```
-
-### Running the Evaluation Script
-
-```bash
+pytest -q
 python eval.py
 ```
 
-Runs 5 predefined user profiles through the recommender and 4 guardrail edge cases, then prints a pass/fail summary. No API key needed.
+---
 
-### Inspecting Individual Scoring Factors
+## Design decisions
 
-```bash
-python score_breakdown.py
-```
-
-The weighted-sum formula in `_score_song()` (`src/recommender.py`) blends four factors — genre (35%), mood (30%), energy proximity (25%), acoustic preference (10%) — into one number, which makes it hard to see what any single factor is actually doing just by looking at a final score. This script prints the raw sub-score, weight, and weighted contribution for all four factors, run against four preset (song, user profile) pairs — each one deliberately chosen so a different factor dominates the total:
-
-```
-=== Genre isolated ===
-Song: "Gym Hero" by Max Pulse (genre=pop, mood=intense, energy=0.93, acousticness=0.05)
-User prefs: {'genre': 'pop', 'mood': 'chill', 'energy': 0.0, 'likes_acoustic': True}
-factor    raw score   weight    contribution
-genre     1.00        0.35      0.3500
-mood      0.00        0.30      0.0000
-energy    0.07        0.25      0.0175
-acoustic  0.05        0.10      0.0050
-TOTAL                           0.3725
--> 'genre' drives 94% of this score
-```
-
-The other three presets (`Mood isolated`, `Energy isolated`, `Acoustic preference isolated`) follow the same pattern — each picks a song/profile pair where three of the four factors are driven near zero, so the remaining factor's contribution to the total is unmistakable. Useful for explaining *why* a given score came out the way it did, one factor at a time, without needing to trace through `recommend_songs()` by hand.
-
-### Deactivating the Virtual Environment
-
-When you're done working, leave the venv with:
-
-```bash
-deactivate
-```
-
-This works the same way on macOS/Linux and Windows (PowerShell or cmd.exe). Your prompt's `(.venv)` prefix disappears once it's deactivated. This only affects your current terminal session — it doesn't delete anything, so activating again later (`.venv\Scripts\Activate.ps1` on Windows PowerShell, `source .venv/bin/activate` on macOS/Linux) picks up right where you left off.
+- **Weighted scoring instead of a trained model:** every score can be explained, factor by factor, and no training data is needed.
+- **Llama for language, code for ranking:** Llama only translates words into settings and explains results. The ranking itself is plain, testable math.
+- **RAG for explanations:** Llama only sees the songs that were found, so it can't invent songs or details.
+- **Graceful degradation everywhere:** no keys, no Colab, or no Redis, and the app still works.
 
 ---
 
-## Sample Interactions
+## Tech stack
 
-**Interaction 1 — Pop / Happy / High Energy**
+Python · Streamlit · pandas · NumPy · Meta Llama 3.2 and 3.3 · Hugging Face Transformers · FastAPI · Cloudflare Workers AI · Cloudflare Tunnel · Upstash Redis · Docker · GitHub Actions · pytest · Google Colab (T4 GPU)
 
-Input: genre=pop, mood=happy, energy=0.85, likes_acoustic=False
+## Coming next
 
-```
-#1 Sunrise City by Neon Echo — Score: 0.98
-[Confidence: High] Matches your favorite genre (pop); fits your 'happy' mood; has very close energy to your target.
+- Store the song data in AWS S3
+- Update `score_breakdown.py` to the new formula
 
-#2 Gym Hero by Max Pulse — Score: 0.66
-[Confidence: Medium] Matches your favorite genre (pop); has similar energy to your target.
-```
+*See [model_card.md](model_card.md) for the reflection and bias analysis.*
 
-Claude's take: *"These selections were curated with your upbeat, high-energy pop taste in mind. Sunrise City by Neon Echo is a near-perfect match — its pop genre, happy mood, and 0.93 energy align almost exactly with your preferences..."*
-
----
-
-**Interaction 2 — Lofi / Chill / Low Energy / Acoustic**
-
-Input: genre=lofi, mood=chill, energy=0.35, likes_acoustic=True
-
-```
-#1 Library Rain by LoRoom — Score: 0.93
-[Confidence: High] Matches your favorite genre (lofi); fits your 'chill' mood; has very close energy to your target.
-
-#2 Midnight Coding by LoRoom — Score: 0.81
-[Confidence: High] Matches your favorite genre (lofi); fits your 'chill' mood; has similar energy to your target.
-```
-
-Claude's take: *"Both picks lean into your love of calm, acoustic lofi textures. Library Rain's acousticness of 0.86 and relaxed energy of 0.35 make it a natural match..."*
-
----
-
-**Interaction 3 — Ambient / Relaxed (mood surfaces cross-genre matches)**
-
-Input: genre=ambient, mood=relaxed, energy=0.3, likes_acoustic=True
-
-```
-#1 Desert Frequencies by Terra Sound — Score: 0.88
-[Confidence: High] Matches your favorite genre (ambient); fits your 'relaxed' mood; has very close energy to your target.
-
-#2 Library Rain by LoRoom — Score: 0.46
-[Confidence: Medium] Fits your 'relaxed' mood; has very close energy to your target.
-```
-
-This shows how the 30% mood weight surfaces cross-genre results when no genre match exists.
-
----
-
-## Design Decisions
-
-- **Weighted scoring instead of ML model:** A transparent formula makes confidence scores interpretable and requires no training data or external APIs beyond what's in the CSV.
-- **RAG over pure generation:** Injecting retrieved song data into the prompt prevents Claude from hallucinating song titles or inventing musical features.
-- **One Claude call for all results:** A single paragraph about the whole playlist is more coherent and cheaper than per-song calls.
-- **Graceful degradation:** If no API key is set, all rule-based features still work. The app never crashes due to a missing key.
-
----
-
-## Reliability, Guardrails, and Evaluation
-
-### Guardrail Behavior
-
-All user inputs pass through `src/guardrails.py` before reaching the recommender. Invalid inputs are rejected with a clear error message — the app never crashes on bad input.
-
-| Input | Problem | Result |
-|---|---|---|
-| `energy = 1.5` | Out of range (must be 0.0–1.0) | `Energy must be a number between 0.0 and 1.0, got: 1.5` |
-| `genre = ""` | Missing required field | `Genre is required.` |
-| `genre = "metal"` | Not in valid set | `Unknown genre 'metal'. Valid options: [...]` |
-| `genre = "lofi", mood = ""` | Missing mood | `Mood is required.` |
-
-In the Streamlit UI, blocked inputs show as a red error banner and stop execution before any scoring occurs.
-
-### AI Explanation Fallback
-
-If no `ANTHROPIC_API_KEY` is set (or the API quota is exceeded), the system falls back gracefully:
-
-```
-[AI explanation unavailable: set ANTHROPIC_API_KEY in your .env file to enable this feature]
-```
-
-All rule-based recommendations, confidence scores, and explanations continue to work normally. The fallback is an intentional design decision — the core system never depends on the AI layer being available.
-
-### Automated Tests
-
-7 pytest tests cover: sorted recommendation output, k-limiting, `load_songs` structure, score ordering, guardrail rejection, and confidence label presence. **7/7 pass.**
-
-### Evaluation Script
-
-`eval.py` runs 5 predefined user profiles and 4 guardrail edge cases end-to-end and prints a structured report:
-
-```
-================================================================
-  SUMMARY
-================================================================
-  Recommendation checks : 5/5 passed
-  Guardrail checks      : 4/4 correctly blocked
-  Overall               : 9/9 checks passed
-================================================================
-```
-
-The system struggled with cross-genre recommendations — if a user's favorite genre has no match in the catalog, scores stay moderate even with good mood/energy alignment. Partial genre credit (e.g., treating "indie pop" and "pop" as 60% similar) would improve this.
-
----
-
-## Reflection
-
-Building this system clarified how much recommender "intelligence" is really just engineered feature weights. The scoring algorithm makes every decision explicit and auditable — unlike a neural recommendation model where the reasoning is opaque. The RAG integration demonstrated why grounding AI generation in retrieved data matters: without injecting actual song attributes into the prompt, Claude could plausibly make up details.
-
-A real production system would need collaborative filtering, much larger catalogs, and careful fairness audits to avoid over-representing popular genres at the expense of niche tastes.
-
----
-
-*See [model_card.md](model_card.md) for full reflection and bias analysis.*
+Built by [William Frank Mahunda](https://www.linkedin.com/in/william-frank-mahunda) · [Portfolio](https://william-frank-mahunda.vercel.app/) · [GitHub](https://github.com/William-franklyn)
