@@ -15,6 +15,8 @@ from recommender import load_songs, recommend_songs
 
 setup_logging()
 
+APP_NAME = "Music Recommendation Engine"
+
 # Use the real Spotify dataset if it's there, otherwise the small sample file
 DATA_PATH = "data/songs.parquet" if os.path.exists("data/songs.parquet") else "data/songs.csv"
 
@@ -39,13 +41,13 @@ def llama_allowed() -> bool:
         st.warning(f"Slow down a little. You can ask Llama again in {wait} seconds. The sidebar search still works.")
         return False
     if not check_daily():
-        st.warning("VibeFinder reached its Llama limit for today. Please try tomorrow, or use the sidebar search.")
+        st.warning("The engine reached its Llama limit for today. Please try tomorrow, or use the sidebar search.")
         return False
     return True
 
 
-st.set_page_config(page_title="VibeFinder", page_icon="🎵", layout="wide")
-st.title("VibeFinder: AI Music Recommender")
+st.set_page_config(page_title=APP_NAME, page_icon="🎵", layout="wide")
+st.title(APP_NAME)
 st.caption("Meta's Llama reads your request, a weighted scoring engine searches real Spotify data, and Llama explains the picks")
 
 songs = get_songs(DATA_PATH)
