@@ -29,15 +29,24 @@ jobs:
       - name: Get the code
         uses: actions/checkout@v4
 
-      - name: Build the Docker image
-        run: docker build -t vibefinder .
+      - name: Set up Docker build tool
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the Docker image (with cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: music-engine:latest
+          load: true                      # keep the image so the next steps can run it
+          cache-from: type=gha            # reuse saved steps from earlier runs
+          cache-to: type=gha,mode=max     # save steps for next time
 
       - name: Run tests inside the container
-        run: docker run --rm vibefinder pytest -q
+        run: docker run --rm music-engine:latest pytest -q
 
       - name: Check the app starts and answers
         run: |
-          docker run -d --name app -p 8501:8501 vibefinder
+          docker run -d --name app -p 8501:8501 music-engine:latest
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8501/_stcore/health; then
               echo " App is healthy"
