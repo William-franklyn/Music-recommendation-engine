@@ -1,6 +1,6 @@
 name: Tests
 
-# Runs every test each time code is pushed to GitHub or a pull request is opened
+# Runs every time code is pushed to GitHub or a pull request is opened
 on: [push, pull_request]
 
 jobs:
@@ -21,3 +21,30 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  docker:
+    needs: test   # only runs if the normal tests pass
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Build the Docker image
+        run: docker build -t vibefinder .
+
+      - name: Run tests inside the container
+        run: docker run --rm vibefinder pytest -q
+
+      - name: Check the app starts and answers
+        run: |
+          docker run -d --name app -p 8501:8501 vibefinder
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8501/_stcore/health; then
+              echo " App is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App did not start"
+          docker logs app
+          exit 1
